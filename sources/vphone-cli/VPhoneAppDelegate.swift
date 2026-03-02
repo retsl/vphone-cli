@@ -8,6 +8,7 @@ class VPhoneAppDelegate: NSObject, NSApplicationDelegate {
     private var control: VPhoneControl?
     private var windowController: VPhoneWindowController?
     private var menuController: VPhoneMenuController?
+    private var fileWindowController: VPhoneFileWindowController?
     private var sigintSource: DispatchSourceSignal?
 
     init(cli: VPhoneCLI) {
@@ -57,7 +58,9 @@ class VPhoneAppDelegate: NSObject, NSApplicationDelegate {
         print("MachID: \(cli.machineId)")
         print("CPU   : \(cli.cpu)")
         print("Memory: \(cli.memory) MB")
-        print("Screen: \(cli.screenWidth)x\(cli.screenHeight) @ \(cli.screenPpi) PPI (scale \(cli.screenScale)x)")
+        print(
+            "Screen: \(cli.screenWidth)x\(cli.screenHeight) @ \(cli.screenPpi) PPI (scale \(cli.screenScale)x)"
+        )
         print("SEP   : enabled")
         print("  storage: \(cli.sepStorage)")
         print("  rom    : \(cli.sepRom)")
@@ -84,13 +87,15 @@ class VPhoneAppDelegate: NSObject, NSApplicationDelegate {
         try await vm.start(forceDFU: cli.dfu)
 
         let control = VPhoneControl()
-        let vphonedURL = URL(fileURLWithPath: cli.vphonedBin)
-        if FileManager.default.fileExists(atPath: vphonedURL.path) {
-            control.guestBinaryURL = vphonedURL
-        }
         self.control = control
-        if let device = vm.virtualMachine.socketDevices.first as? VZVirtioSocketDevice {
-            control.connect(device: device)
+        if !cli.dfu {
+            let vphonedURL = URL(fileURLWithPath: cli.vphonedBin)
+            if FileManager.default.fileExists(atPath: vphonedURL.path) {
+                control.guestBinaryURL = vphonedURL
+            }
+            if let device = vm.virtualMachine.socketDevices.first as? VZVirtioSocketDevice {
+                control.connect(device: device)
+            }
         }
 
         if !cli.noGraphics {
@@ -101,14 +106,20 @@ class VPhoneAppDelegate: NSObject, NSApplicationDelegate {
                 screenWidth: cli.screenWidth,
                 screenHeight: cli.screenHeight,
                 screenScale: cli.screenScale,
-                keyHelper: keyHelper
+                keyHelper: keyHelper,
+                control: control
             )
             windowController = wc
-            menuController = VPhoneMenuController(keyHelper: keyHelper)
 
-            if !cli.dfu {
-                keyHelper.autoUnlock(delay: 8)
+            let fileWC = VPhoneFileWindowController()
+            fileWindowController = fileWC
+
+            let mc = VPhoneMenuController(keyHelper: keyHelper, control: control)
+            mc.onFilesPressed = { [weak fileWC, weak control] in
+                guard let fileWC, let control else { return }
+                fileWC.showWindow(control: control)
             }
+            menuController = mc
         }
     }
 

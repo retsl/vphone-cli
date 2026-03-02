@@ -30,18 +30,69 @@ class VPhoneControl {
     private var guestBinaryHash: String?
     private var nextRequestId: UInt64 = 0
 
+    // MARK: - Pending Requests
+
+    /// Callback for a pending request. Called on the read-loop queue.
+    private struct PendingRequest: @unchecked Sendable {
+        let handler: (Result<([String: Any], Data?), any Error>) -> Void
+    }
+
+    private let pendingLock = NSLock()
+    private nonisolated(unsafe) var pendingRequests: [String: PendingRequest] = [:]
+
+    private nonisolated func addPending(
+        id: String, handler: @escaping (Result<([String: Any], Data?), any Error>) -> Void
+    ) {
+        pendingLock.lock()
+        pendingRequests[id] = PendingRequest(handler: handler)
+        pendingLock.unlock()
+    }
+
+    private nonisolated func removePending(id: String) -> PendingRequest? {
+        pendingLock.lock()
+        defer { pendingLock.unlock() }
+        return pendingRequests.removeValue(forKey: id)
+    }
+
+    private nonisolated func failAllPending() {
+        pendingLock.lock()
+        let pending = pendingRequests
+        pendingRequests.removeAll()
+        pendingLock.unlock()
+        for (_, req) in pending {
+            req.handler(.failure(ControlError.notConnected))
+        }
+    }
+
+    enum ControlError: Error, CustomStringConvertible {
+        case notConnected
+        case protocolError(String)
+        case guestError(String)
+
+        var description: String {
+            switch self {
+            case .notConnected: "not connected to vphoned"
+            case let .protocolError(msg): "protocol error: \(msg)"
+            case let .guestError(msg): msg
+            }
+        }
+    }
+
     // MARK: - Guest Binary Hash
 
     private func loadGuestBinary() {
         guard let url = guestBinaryURL,
-              let data = try? Data(contentsOf: url) else {
+              let data = try? Data(contentsOf: url)
+        else {
             guestBinaryData = nil
             guestBinaryHash = nil
             return
         }
         guestBinaryData = data
         guestBinaryHash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        print("[control] vphoned binary: \(url.lastPathComponent) (\(data.count) bytes, \(guestBinaryHash!.prefix(12))...)")
+        print(
+            "[control] vphoned binary: \(url.lastPathComponent) (\(data.count) bytes, \(guestBinaryHash!.prefix(12))...)"
+        )
     }
 
     // MARK: - Connect
@@ -54,13 +105,14 @@ class VPhoneControl {
 
     private func attemptConnect() {
         guard let device else { return }
-        device.connect(toPort: Self.vsockPort) { [weak self] (result: Result<VZVirtioSocketConnection, any Error>) in
+        device.connect(toPort: Self.vsockPort) {
+            [weak self] (result: Result<VZVirtioSocketConnection, any Error>) in
             Task { @MainActor in
                 switch result {
-                case .success(let conn):
+                case let .success(conn):
                     self?.connection = conn
                     self?.performHandshake(fd: conn.fileDescriptor)
-                case .failure(let error):
+                case let .failure(error):
                     print("[control] vsock: \(error.localizedDescription), retrying...")
                     DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                         self?.attemptConnect()
@@ -101,7 +153,9 @@ class VPhoneControl {
             Task { @MainActor in
                 guard let self else { return }
                 guard type == "hello", version == Self.protocolVersion else {
-                    print("[control] handshake: version mismatch (guest v\(version), host v\(Self.protocolVersion))")
+                    print(
+                        "[control] handshake: version mismatch (guest v\(version), host v\(Self.protocolVersion))"
+                    )
                     self.disconnect()
                     return
                 }
@@ -130,7 +184,10 @@ class VPhoneControl {
 
         print("[control] pushing update (\(data.count) bytes)...")
         nextRequestId += 1
-        let header: [String: Any] = ["v": Self.protocolVersion, "t": "update", "id": String(nextRequestId, radix: 16), "size": data.count]
+        let header: [String: Any] = [
+            "v": Self.protocolVersion, "t": "update", "id": String(nextRequestId, radix: 16),
+            "size": data.count,
+        ]
         guard writeMessage(fd: fd, dict: header) else {
             print("[control] update: failed to send header")
             disconnect()
@@ -153,25 +210,174 @@ class VPhoneControl {
     // MARK: - Send Commands
 
     func sendHIDPress(page: UInt32, usage: UInt32) {
+        sendHID(page: page, usage: usage, down: nil)
+    }
+
+    func sendHIDDown(page: UInt32, usage: UInt32) {
+        sendHID(page: page, usage: usage, down: true)
+    }
+
+    func sendHIDUp(page: UInt32, usage: UInt32) {
+        sendHID(page: page, usage: usage, down: false)
+    }
+
+    private func sendHID(page: UInt32, usage: UInt32, down: Bool?) {
         nextRequestId += 1
-        let msg: [String: Any] = [
+        var msg: [String: Any] = [
             "v": Self.protocolVersion,
             "t": "hid",
             "id": String(nextRequestId, radix: 16),
             "page": page,
             "usage": usage,
         ]
+        if let down { msg["down"] = down }
         guard let fd = connection?.fileDescriptor, writeMessage(fd: fd, dict: msg) else {
             print("[control] send failed (not connected)")
             return
         }
-        print("[control] hid page=0x\(String(page, radix: 16)) usage=0x\(String(usage, radix: 16))")
+        let suffix = down.map { $0 ? " down" : " up" } ?? ""
+        print(
+            "[control] hid page=0x\(String(page, radix: 16)) usage=0x\(String(usage, radix: 16))\(suffix)"
+        )
+    }
+
+    // MARK: - Developer Mode
+
+    func sendDevModeStatus() {
+        nextRequestId += 1
+        let msg: [String: Any] = [
+            "v": Self.protocolVersion,
+            "t": "devmode",
+            "id": String(nextRequestId, radix: 16),
+            "action": "status",
+        ]
+        guard let fd = connection?.fileDescriptor, writeMessage(fd: fd, dict: msg) else {
+            print("[control] send failed (not connected)")
+            return
+        }
+        print("[control] devmode status query sent")
+    }
+
+    func sendDevModeEnable() {
+        nextRequestId += 1
+        let msg: [String: Any] = [
+            "v": Self.protocolVersion,
+            "t": "devmode",
+            "id": String(nextRequestId, radix: 16),
+            "action": "enable",
+        ]
+        guard let fd = connection?.fileDescriptor, writeMessage(fd: fd, dict: msg) else {
+            print("[control] send failed (not connected)")
+            return
+        }
+        print("[control] devmode enable sent")
     }
 
     func sendPing() {
         nextRequestId += 1
-        let msg: [String: Any] = ["v": Self.protocolVersion, "t": "ping", "id": String(nextRequestId, radix: 16)]
+        let msg: [String: Any] = [
+            "v": Self.protocolVersion, "t": "ping", "id": String(nextRequestId, radix: 16),
+        ]
         guard let fd = connection?.fileDescriptor, writeMessage(fd: fd, dict: msg) else { return }
+    }
+
+    // MARK: - Async Request-Response
+
+    /// Send a request and await the response. Returns the response dict and optional raw data.
+    func sendRequest(_ dict: [String: Any]) async throws -> ([String: Any], Data?) {
+        guard let fd = connection?.fileDescriptor else {
+            throw ControlError.notConnected
+        }
+
+        nextRequestId += 1
+        let reqId = String(nextRequestId, radix: 16)
+        var msg = dict
+        msg["v"] = Self.protocolVersion
+        msg["id"] = reqId
+
+        return try await withCheckedThrowingContinuation { continuation in
+            addPending(id: reqId) { result in
+                nonisolated(unsafe) let r = result
+                continuation.resume(with: r)
+            }
+            guard writeMessage(fd: fd, dict: msg) else {
+                _ = removePending(id: reqId)
+                continuation.resume(throwing: ControlError.notConnected)
+                return
+            }
+        }
+    }
+
+    // MARK: - File Operations
+
+    func listFiles(path: String) async throws -> [[String: Any]] {
+        let (resp, _) = try await sendRequest(["t": "file_list", "path": path])
+        guard let entries = resp["entries"] as? [[String: Any]] else {
+            throw ControlError.protocolError("missing entries in response")
+        }
+        return entries
+    }
+
+    func downloadFile(path: String) async throws -> Data {
+        let (_, data) = try await sendRequest(["t": "file_get", "path": path])
+        guard let data else {
+            throw ControlError.protocolError("no file data received")
+        }
+        return data
+    }
+
+    func uploadFile(path: String, data: Data, permissions: String = "644") async throws {
+        guard let fd = connection?.fileDescriptor else {
+            throw ControlError.notConnected
+        }
+
+        nextRequestId += 1
+        let reqId = String(nextRequestId, radix: 16)
+        let header: [String: Any] = [
+            "v": Self.protocolVersion,
+            "t": "file_put",
+            "id": reqId,
+            "path": path,
+            "size": data.count,
+            "perm": permissions,
+        ]
+
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, any Error>) in
+            addPending(id: reqId) { result in
+                switch result {
+                case .success: continuation.resume()
+                case let .failure(error): continuation.resume(throwing: error)
+                }
+            }
+
+            // Write header + raw data atomically (same pattern as pushUpdate)
+            guard writeMessage(fd: fd, dict: header) else {
+                _ = removePending(id: reqId)
+                continuation.resume(throwing: ControlError.notConnected)
+                return
+            }
+            let ok = data.withUnsafeBytes { buf in
+                Self.writeFully(fd: fd, buf: buf.baseAddress!, count: data.count)
+            }
+            guard ok else {
+                _ = removePending(id: reqId)
+                continuation.resume(throwing: ControlError.protocolError("failed to write file data"))
+                return
+            }
+        }
+    }
+
+    func createDirectory(path: String) async throws {
+        _ = try await sendRequest(["t": "file_mkdir", "path": path])
+    }
+
+    func deleteFile(path: String) async throws {
+        _ = try await sendRequest(["t": "file_delete", "path": path])
+    }
+
+    func renameFile(from: String, to: String) async throws {
+        _ = try await sendRequest(["t": "file_rename", "from": from, "to": to])
     }
 
     // MARK: - Disconnect & Reconnect
@@ -182,6 +388,9 @@ class VPhoneControl {
         isConnected = false
         guestName = ""
         guestCaps = []
+
+        // Fail all pending requests
+        failAllPending()
 
         if wasConnected, device != nil {
             print("[control] reconnecting in 3s...")
@@ -197,7 +406,43 @@ class VPhoneControl {
     private func startReadLoop(fd: Int32) {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             while let msg = Self.readMessage(fd: fd) {
+                guard let self else { break }
                 let type = msg["t"] as? String ?? ""
+                let reqId = msg["id"] as? String
+
+                // Check for pending request callback
+                if let reqId, let pending = removePending(id: reqId) {
+                    if type == "err" {
+                        let detail = msg["msg"] as? String ?? "unknown error"
+                        pending.handler(.failure(ControlError.guestError(detail)))
+                        continue
+                    }
+
+                    // For file_data, read inline binary payload
+                    if type == "file_data" {
+                        let size = msg["size"] as? Int ?? 0
+                        if size > 0 {
+                            let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: size)
+                            if Self.readFully(fd: fd, buf: buf, count: size) {
+                                let data = Data(bytes: buf, count: size)
+                                buf.deallocate()
+                                pending.handler(.success((msg, data)))
+                            } else {
+                                buf.deallocate()
+                                pending.handler(.failure(ControlError.protocolError("failed to read file data")))
+                            }
+                        } else {
+                            pending.handler(.success((msg, Data())))
+                        }
+                        continue
+                    }
+
+                    // Normal response (ok, pong, etc.)
+                    pending.handler(.success((msg, nil)))
+                    continue
+                }
+
+                // No pending request — handle as before (fire-and-forget)
                 switch type {
                 case "ok":
                     let detail = msg["msg"] as? String ?? ""
@@ -234,7 +479,7 @@ class VPhoneControl {
         }
     }
 
-    nonisolated private static func readMessage(fd: Int32) -> [String: Any]? {
+    private nonisolated static func readMessage(fd: Int32) -> [String: Any]? {
         var header: UInt32 = 0
         let hRead = withUnsafeMutableBytes(of: &header) { buf in
             readFully(fd: fd, buf: buf.baseAddress!, count: 4)
@@ -252,7 +497,9 @@ class VPhoneControl {
         return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     }
 
-    nonisolated private static func readFully(fd: Int32, buf: UnsafeMutableRawPointer, count: Int) -> Bool {
+    private nonisolated static func readFully(fd: Int32, buf: UnsafeMutableRawPointer, count: Int)
+        -> Bool
+    {
         var offset = 0
         while offset < count {
             let n = Darwin.read(fd, buf + offset, count - offset)
@@ -262,7 +509,7 @@ class VPhoneControl {
         return true
     }
 
-    nonisolated private static func writeFully(fd: Int32, buf: UnsafeRawPointer, count: Int) -> Bool {
+    private nonisolated static func writeFully(fd: Int32, buf: UnsafeRawPointer, count: Int) -> Bool {
         var offset = 0
         while offset < count {
             let n = Darwin.write(fd, buf + offset, count - offset)

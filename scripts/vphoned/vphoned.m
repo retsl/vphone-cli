@@ -10,7 +10,8 @@
  * code in main() exec's the cached binary.
  *
  * Capabilities:
- *   hid — inject HID events (Home, Power, Lock, Unlock) via IOKit
+ *   hid     — inject HID events (Home, Power, Lock, Unlock) via IOKit
+ *   devmode — enable developer mode via AMFI XPC
  *
  * Protocol:
  *   Each message: [uint32 big-endian length][UTF-8 JSON payload]
@@ -147,12 +148,124 @@ static void press(uint32_t page, uint32_t usage) {
     CFRelease(up);
 }
 
+// MARK: - Developer Mode (AMFI XPC)
+//
+// Talks to com.apple.amfi.xpc to query / arm developer mode.
+// Reference: TrollStore RootHelper/devmode.m
+// Requires entitlement: com.apple.private.amfi.developer-mode-control
+
+// XPC functions resolved via dlsym to avoid iOS SDK availability
+// guards (xpc_connection_create_mach_service is marked unavailable
+// on iOS but works at runtime with the right entitlements).
+
+typedef void *xpc_conn_t;  // opaque, avoids typedef conflict with SDK
+typedef void *xpc_obj_t;
+
+static xpc_conn_t (*pXpcCreateMach)(const char *, dispatch_queue_t, uint64_t);
+static void (*pXpcSetHandler)(xpc_conn_t, void (^)(xpc_obj_t));
+static void (*pXpcResume)(xpc_conn_t);
+static void (*pXpcCancel)(xpc_conn_t);
+static xpc_obj_t (*pXpcSendSync)(xpc_conn_t, xpc_obj_t);
+static xpc_obj_t (*pXpcDictGet)(xpc_obj_t, const char *);
+static xpc_obj_t (*pCFToXPC)(CFTypeRef);
+static CFTypeRef (*pXPCToCF)(xpc_obj_t);
+
+static BOOL load_xpc(void) {
+    void *libxpc = dlopen("/usr/lib/system/libxpc.dylib", RTLD_NOW);
+    if (!libxpc) { NSLog(@"vphoned: dlopen libxpc failed"); return NO; }
+
+    void *libcf = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_NOW);
+    if (!libcf) { NSLog(@"vphoned: dlopen CoreFoundation failed"); return NO; }
+
+    pXpcCreateMach = dlsym(libxpc, "xpc_connection_create_mach_service");
+    pXpcSetHandler = dlsym(libxpc, "xpc_connection_set_event_handler");
+    pXpcResume     = dlsym(libxpc, "xpc_connection_resume");
+    pXpcCancel     = dlsym(libxpc, "xpc_connection_cancel");
+    pXpcSendSync   = dlsym(libxpc, "xpc_connection_send_message_with_reply_sync");
+    pXpcDictGet    = dlsym(libxpc, "xpc_dictionary_get_value");
+    pCFToXPC       = dlsym(libcf, "_CFXPCCreateXPCMessageWithCFObject");
+    pXPCToCF       = dlsym(libcf, "_CFXPCCreateCFObjectFromXPCMessage");
+
+    if (!pXpcCreateMach || !pXpcSetHandler || !pXpcResume || !pXpcCancel ||
+        !pXpcSendSync || !pXpcDictGet || !pCFToXPC || !pXPCToCF) {
+        NSLog(@"vphoned: missing XPC/CF symbols");
+        return NO;
+    }
+
+    NSLog(@"vphoned: XPC loaded");
+    return YES;
+}
+
+typedef enum {
+    kAMFIActionArm    = 0,  // arm developer mode (prompts on next reboot)
+    kAMFIActionDisable = 1, // disable developer mode immediately
+    kAMFIActionStatus = 2,  // query: {success, status, armed}
+} AMFIXPCAction;
+
+static NSDictionary *amfi_send(AMFIXPCAction action) {
+    xpc_conn_t conn = pXpcCreateMach("com.apple.amfi.xpc", NULL, 0);
+    if (!conn) {
+        NSLog(@"vphoned: amfi xpc connection failed");
+        return nil;
+    }
+    pXpcSetHandler(conn, ^(xpc_obj_t event) {});
+    pXpcResume(conn);
+
+    xpc_obj_t msg = pCFToXPC((__bridge CFDictionaryRef)@{@"action": @(action)});
+    xpc_obj_t reply = pXpcSendSync(conn, msg);
+    pXpcCancel(conn);
+    if (!reply) {
+        NSLog(@"vphoned: amfi xpc no reply");
+        return nil;
+    }
+
+    xpc_obj_t cfReply = pXpcDictGet(reply, "cfreply");
+    if (!cfReply) {
+        NSLog(@"vphoned: amfi xpc no cfreply");
+        return nil;
+    }
+
+    NSDictionary *dict = (__bridge_transfer NSDictionary *)pXPCToCF(cfReply);
+    NSLog(@"vphoned: amfi reply: %@", dict);
+    return dict;
+}
+
+static BOOL devmode_status(void) {
+    NSDictionary *reply = amfi_send(kAMFIActionStatus);
+    if (!reply) return NO;
+    NSNumber *success = reply[@"success"];
+    if (!success || ![success boolValue]) return NO;
+    NSNumber *status = reply[@"status"];
+    return [status boolValue];
+}
+
+static BOOL devmode_arm(BOOL *alreadyEnabled) {
+    BOOL enabled = devmode_status();
+    if (alreadyEnabled) *alreadyEnabled = enabled;
+    if (enabled) return YES;
+
+    NSDictionary *reply = amfi_send(kAMFIActionArm);
+    if (!reply) return NO;
+    NSNumber *success = reply[@"success"];
+    return success && [success boolValue];
+}
+
 // MARK: - Protocol Framing
 
 static BOOL read_fully(int fd, void *buf, size_t count) {
     size_t offset = 0;
     while (offset < count) {
         ssize_t n = read(fd, (uint8_t *)buf + offset, count - offset);
+        if (n <= 0) return NO;
+        offset += n;
+    }
+    return YES;
+}
+
+static BOOL write_fully(int fd, const void *buf, size_t count) {
+    size_t offset = 0;
+    while (offset < count) {
+        ssize_t n = write(fd, (const uint8_t *)buf + offset, count - offset);
         if (n <= 0) return NO;
         offset += n;
     }
@@ -194,6 +307,259 @@ static NSMutableDictionary *make_response(NSString *type, id reqId) {
     return r;
 }
 
+// MARK: - File Operations
+//
+// Handle file_list, file_get, file_put, file_mkdir, file_delete, file_rename.
+// file_get and file_put perform inline binary I/O on the socket, so they
+// need the fd directly (can't use the simple return-dict pattern).
+
+/// Handle a file command. Returns a response dict, or nil if the response
+/// was already written inline (file_get with streaming data).
+static NSDictionary *handle_file_command(int fd, NSDictionary *msg) {
+    NSString *type = msg[@"t"];
+    id reqId = msg[@"id"];
+
+    // -- file_list: list directory contents --
+    if ([type isEqualToString:@"file_list"]) {
+        NSString *path = msg[@"path"];
+        if (!path) {
+            NSMutableDictionary *r = make_response(@"err", reqId);
+            r[@"msg"] = @"missing path";
+            return r;
+        }
+
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSError *err = nil;
+        NSArray *contents = [fm contentsOfDirectoryAtPath:path error:&err];
+        if (!contents) {
+            NSMutableDictionary *r = make_response(@"err", reqId);
+            r[@"msg"] = err.localizedDescription ?: @"list failed";
+            return r;
+        }
+
+        NSMutableArray *entries = [NSMutableArray arrayWithCapacity:contents.count];
+        for (NSString *name in contents) {
+            NSString *full = [path stringByAppendingPathComponent:name];
+            NSDictionary *attrs = [fm attributesOfItemAtPath:full error:nil];
+            if (!attrs) continue;
+
+            NSString *fileType = attrs[NSFileType];
+            NSString *typeStr = @"file";
+            if ([fileType isEqualToString:NSFileTypeDirectory]) typeStr = @"dir";
+            else if ([fileType isEqualToString:NSFileTypeSymbolicLink]) typeStr = @"link";
+
+            NSNumber *size = attrs[NSFileSize] ?: @0;
+            NSDate *mtime = attrs[NSFileModificationDate];
+            NSNumber *posixPerms = attrs[NSFilePosixPermissions];
+
+            [entries addObject:@{
+                @"name": name,
+                @"type": typeStr,
+                @"size": size,
+                @"perm": [NSString stringWithFormat:@"%lo", [posixPerms unsignedLongValue]],
+                @"mtime": @(mtime ? [mtime timeIntervalSince1970] : 0),
+            }];
+        }
+
+        NSMutableDictionary *r = make_response(@"ok", reqId);
+        r[@"entries"] = entries;
+        return r;
+    }
+
+    // -- file_get: download file from guest to host --
+    if ([type isEqualToString:@"file_get"]) {
+        NSString *path = msg[@"path"];
+        if (!path) {
+            NSMutableDictionary *r = make_response(@"err", reqId);
+            r[@"msg"] = @"missing path";
+            return r;
+        }
+
+        struct stat st;
+        if (stat([path fileSystemRepresentation], &st) != 0) {
+            NSMutableDictionary *r = make_response(@"err", reqId);
+            r[@"msg"] = [NSString stringWithFormat:@"stat failed: %s", strerror(errno)];
+            return r;
+        }
+        if (!S_ISREG(st.st_mode)) {
+            NSMutableDictionary *r = make_response(@"err", reqId);
+            r[@"msg"] = @"not a regular file";
+            return r;
+        }
+
+        int fileFd = open([path fileSystemRepresentation], O_RDONLY);
+        if (fileFd < 0) {
+            NSMutableDictionary *r = make_response(@"err", reqId);
+            r[@"msg"] = [NSString stringWithFormat:@"open failed: %s", strerror(errno)];
+            return r;
+        }
+
+        // Send header with file size
+        NSMutableDictionary *header = make_response(@"file_data", reqId);
+        header[@"size"] = @((unsigned long long)st.st_size);
+        if (!write_message(fd, header)) {
+            close(fileFd);
+            return nil;
+        }
+
+        // Stream file data in chunks
+        uint8_t buf[32768];
+        ssize_t n;
+        while ((n = read(fileFd, buf, sizeof(buf))) > 0) {
+            if (!write_fully(fd, buf, (size_t)n)) {
+                NSLog(@"vphoned: file_get write failed for %@", path);
+                close(fileFd);
+                return nil;
+            }
+        }
+        close(fileFd);
+        return nil; // Response already written inline
+    }
+
+    // -- file_put: upload file from host to guest --
+    if ([type isEqualToString:@"file_put"]) {
+        NSString *path = msg[@"path"];
+        NSUInteger size = [msg[@"size"] unsignedIntegerValue];
+        NSString *perm = msg[@"perm"];
+
+        if (!path) {
+            // Must still drain the raw bytes to keep protocol in sync
+            if (size > 0) {
+                uint8_t drain[32768];
+                NSUInteger remaining = size;
+                while (remaining > 0) {
+                    size_t chunk = remaining < sizeof(drain) ? remaining : sizeof(drain);
+                    if (!read_fully(fd, drain, chunk)) break;
+                    remaining -= chunk;
+                }
+            }
+            NSMutableDictionary *r = make_response(@"err", reqId);
+            r[@"msg"] = @"missing path";
+            return r;
+        }
+
+        // Create parent directories if needed
+        NSString *parent = [path stringByDeletingLastPathComponent];
+        [[NSFileManager defaultManager] createDirectoryAtPath:parent
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil
+                                                        error:nil];
+
+        // Write to temp file, then rename (atomic, same pattern as receive_update)
+        char tmp_path[PATH_MAX];
+        snprintf(tmp_path, sizeof(tmp_path), "%s.XXXXXX", [path fileSystemRepresentation]);
+        int tmp_fd = mkstemp(tmp_path);
+        if (tmp_fd < 0) {
+            // Drain bytes
+            uint8_t drain[32768];
+            NSUInteger remaining = size;
+            while (remaining > 0) {
+                size_t chunk = remaining < sizeof(drain) ? remaining : sizeof(drain);
+                if (!read_fully(fd, drain, chunk)) break;
+                remaining -= chunk;
+            }
+            NSMutableDictionary *r = make_response(@"err", reqId);
+            r[@"msg"] = [NSString stringWithFormat:@"mkstemp failed: %s", strerror(errno)];
+            return r;
+        }
+
+        uint8_t buf[32768];
+        NSUInteger remaining = size;
+        BOOL ok = YES;
+        while (remaining > 0) {
+            size_t chunk = remaining < sizeof(buf) ? remaining : sizeof(buf);
+            if (!read_fully(fd, buf, chunk)) { ok = NO; break; }
+            if (write(tmp_fd, buf, chunk) != (ssize_t)chunk) { ok = NO; break; }
+            remaining -= chunk;
+        }
+        close(tmp_fd);
+
+        if (!ok) {
+            unlink(tmp_path);
+            NSMutableDictionary *r = make_response(@"err", reqId);
+            r[@"msg"] = @"file transfer failed";
+            return r;
+        }
+
+        // Set permissions
+        if (perm) {
+            unsigned long mode = strtoul([perm UTF8String], NULL, 8);
+            chmod(tmp_path, (mode_t)mode);
+        } else {
+            chmod(tmp_path, 0644);
+        }
+
+        if (rename(tmp_path, [path fileSystemRepresentation]) != 0) {
+            unlink(tmp_path);
+            NSMutableDictionary *r = make_response(@"err", reqId);
+            r[@"msg"] = [NSString stringWithFormat:@"rename failed: %s", strerror(errno)];
+            return r;
+        }
+
+        NSLog(@"vphoned: file_put %@ (%lu bytes)", path, (unsigned long)size);
+        return make_response(@"ok", reqId);
+    }
+
+    // -- file_mkdir --
+    if ([type isEqualToString:@"file_mkdir"]) {
+        NSString *path = msg[@"path"];
+        if (!path) {
+            NSMutableDictionary *r = make_response(@"err", reqId);
+            r[@"msg"] = @"missing path";
+            return r;
+        }
+        NSError *err = nil;
+        if (![[NSFileManager defaultManager] createDirectoryAtPath:path
+                                       withIntermediateDirectories:YES
+                                                        attributes:nil
+                                                             error:&err]) {
+            NSMutableDictionary *r = make_response(@"err", reqId);
+            r[@"msg"] = err.localizedDescription ?: @"mkdir failed";
+            return r;
+        }
+        return make_response(@"ok", reqId);
+    }
+
+    // -- file_delete --
+    if ([type isEqualToString:@"file_delete"]) {
+        NSString *path = msg[@"path"];
+        if (!path) {
+            NSMutableDictionary *r = make_response(@"err", reqId);
+            r[@"msg"] = @"missing path";
+            return r;
+        }
+        NSError *err = nil;
+        if (![[NSFileManager defaultManager] removeItemAtPath:path error:&err]) {
+            NSMutableDictionary *r = make_response(@"err", reqId);
+            r[@"msg"] = err.localizedDescription ?: @"delete failed";
+            return r;
+        }
+        return make_response(@"ok", reqId);
+    }
+
+    // -- file_rename --
+    if ([type isEqualToString:@"file_rename"]) {
+        NSString *from = msg[@"from"];
+        NSString *to = msg[@"to"];
+        if (!from || !to) {
+            NSMutableDictionary *r = make_response(@"err", reqId);
+            r[@"msg"] = @"missing from/to";
+            return r;
+        }
+        NSError *err = nil;
+        if (![[NSFileManager defaultManager] moveItemAtPath:from toPath:to error:&err]) {
+            NSMutableDictionary *r = make_response(@"err", reqId);
+            r[@"msg"] = err.localizedDescription ?: @"rename failed";
+            return r;
+        }
+        return make_response(@"ok", reqId);
+    }
+
+    NSMutableDictionary *r = make_response(@"err", reqId);
+    r[@"msg"] = [NSString stringWithFormat:@"unknown file command: %@", type];
+    return r;
+}
+
 // MARK: - Command Dispatch
 
 static NSDictionary *handle_command(NSDictionary *msg) {
@@ -203,8 +569,49 @@ static NSDictionary *handle_command(NSDictionary *msg) {
     if ([type isEqualToString:@"hid"]) {
         uint32_t page  = [msg[@"page"] unsignedIntValue];
         uint32_t usage = [msg[@"usage"] unsignedIntValue];
-        press(page, usage);
+        NSNumber *downVal = msg[@"down"];
+        if (downVal != nil) {
+            // Single down or up event (for modifier combos)
+            IOHIDEventRef ev = pKeyboard(kCFAllocatorDefault, mach_absolute_time(),
+                                         page, usage, [downVal boolValue] ? 1 : 0, 0);
+            if (ev) { send_hid_event(ev); CFRelease(ev); }
+        } else {
+            // Full press (down + 100ms + up)
+            press(page, usage);
+        }
         return make_response(@"ok", reqId);
+    }
+
+    if ([type isEqualToString:@"devmode"]) {
+        if (!pXpcCreateMach) {
+            NSMutableDictionary *r = make_response(@"err", reqId);
+            r[@"msg"] = @"XPC not available";
+            return r;
+        }
+        NSString *action = msg[@"action"];
+        if ([action isEqualToString:@"status"]) {
+            BOOL enabled = devmode_status();
+            NSMutableDictionary *r = make_response(@"ok", reqId);
+            r[@"enabled"] = @(enabled);
+            return r;
+        }
+        if ([action isEqualToString:@"enable"]) {
+            BOOL alreadyEnabled = NO;
+            BOOL ok = devmode_arm(&alreadyEnabled);
+            NSMutableDictionary *r = make_response(ok ? @"ok" : @"err", reqId);
+            if (ok) {
+                r[@"already_enabled"] = @(alreadyEnabled);
+                r[@"msg"] = alreadyEnabled
+                    ? @"developer mode already enabled"
+                    : @"developer mode armed, reboot to activate";
+            } else {
+                r[@"msg"] = @"failed to arm developer mode";
+            }
+            return r;
+        }
+        NSMutableDictionary *r = make_response(@"err", reqId);
+        r[@"msg"] = [NSString stringWithFormat:@"unknown devmode action: %@", action];
+        return r;
     }
 
     if ([type isEqualToString:@"ping"]) {
@@ -307,7 +714,7 @@ static BOOL handle_client(int fd) {
             @"v": @PROTOCOL_VERSION,
             @"t": @"hello",
             @"name": @"vphoned",
-            @"caps": @[@"hid"],
+            @"caps": @[@"hid", @"devmode", @"file"],
         } mutableCopy];
         if (needUpdate) helloResp[@"need_update"] = @YES;
 
@@ -338,6 +745,13 @@ static BOOL handle_client(int fd) {
                     continue;
                 }
 
+                // File operations (need fd for inline binary transfer)
+                if ([t hasPrefix:@"file_"]) {
+                    NSDictionary *resp = handle_file_command(fd, msg);
+                    if (resp && !write_message(fd, resp)) break;
+                    continue;
+                }
+
                 NSDictionary *resp = handle_command(msg);
                 if (resp && !write_message(fd, resp)) break;
             }
@@ -365,6 +779,7 @@ int main(int argc, char *argv[]) {
         NSLog(@"vphoned: starting (pid=%d, path=%s)", getpid(), selfPath ?: "?");
 
         if (!load_iokit()) return 1;
+        if (!load_xpc()) NSLog(@"vphoned: XPC unavailable, devmode disabled");
 
         int sock = socket(AF_VSOCK, SOCK_STREAM, 0);
         if (sock < 0) { perror("vphoned: socket(AF_VSOCK)"); return 1; }
