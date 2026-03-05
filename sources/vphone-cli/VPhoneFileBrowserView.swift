@@ -313,7 +313,9 @@ struct VPhoneFileBrowserView: View {
                     urls.append(url)
                 }
             }
-            if !urls.isEmpty {
+            if urls.isEmpty {
+                model.error = "Could not load any files from the dropped items."
+            } else {
                 await model.uploadFiles(urls: urls)
             }
         }

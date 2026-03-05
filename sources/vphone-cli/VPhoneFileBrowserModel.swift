@@ -172,9 +172,13 @@ class VPhoneFileBrowserModel {
     }
 
     func uploadFiles(urls: [URL]) async {
+        var uploadError: String?
         for url in urls {
-            guard let data = try? Data(contentsOf: url) else { continue }
             let name = url.lastPathComponent
+            guard let data = try? Data(contentsOf: url) else {
+                uploadError = "Could not read \"\(name)\" from disk."
+                break
+            }
             let dest = (currentPath as NSString).appendingPathComponent(name)
             transferName = name
             transferTotal = Int64(data.count)
@@ -184,11 +188,14 @@ class VPhoneFileBrowserModel {
                 transferCurrent = Int64(data.count)
                 print("[files] uploaded \(name) (\(data.count) bytes)")
             } catch {
-                self.error = "Upload failed: \(error)"
+                uploadError = "Upload failed for \"\(name)\": \(error)"
+                break
             }
         }
         transferName = nil
         await refresh()
+        // Set error after refresh so refresh() doesn't clear it before the alert fires.
+        if let e = uploadError { self.error = e }
     }
 
     func createNewFolder(name: String) async {
