@@ -21,7 +21,7 @@ Three patch variants are available with increasing levels of security bypass:
 
 | Variant         | Boot Chain  |    CFW    | Make Targets                       |
 | --------------- | :---------: | :-------: | ---------------------------------- |
-| **Regular**     | 41 patches  | 10 phases | `fw_patch` + `cfw_install`         |
+| **Regular**     | 0 patches  | 10 phases | `fw_patch` + `cfw_install`         |
 | **Development** | 52 patches  | 12 phases | `fw_patch_dev` + `cfw_install_dev` |
 | **Jailbreak**   | 112 patches | 14 phases | `fw_patch_jb` + `cfw_install_jb`   |
 
@@ -87,7 +87,7 @@ Boot into Recovery (long press power button), open Terminal, then choose one set
 **Install dependencies:**
 
 ```bash
-brew install aria2 ideviceinstaller wget gnu-tar openssl@3 ldid-procursus sshpass keystone autoconf automake pkg-config libtool cmake
+brew install aria2 ideviceinstaller wget gnu-tar openssl@3 ldid-procursus sshpass keystone autoconf automake pkg-config libtool cmake ipsw
 ```
 
 `scripts/fw_prepare.sh` prefers `aria2c` for faster multi-connection downloads and falls back to `curl` or `wget` when needed.
