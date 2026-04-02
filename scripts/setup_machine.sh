@@ -58,6 +58,7 @@ NONE_INTERACTIVE=0
 JB_MODE=0
 DEV_MODE=0
 LESS_MODE=0
+DEBUG_MODE=0
 SKIP_PROJECT_SETUP=0
 
 die() {
@@ -949,17 +950,21 @@ parse_args() {
       --less)
         LESS_MODE=1
         ;;
+      --debug)
+        DEBUG_MODE=1
+        ;;
       --skip-project-setup)
         SKIP_PROJECT_SETUP=1
         ;;
       -h|--help)
         cat <<'EOF'
-Usage: setup_machine.sh [--jb] [--dev] [--skip-project-setup]
+Usage: setup_machine.sh [--jb] [--dev] [--less] [--debug] [--skip-project-setup]
 
 Options:
   --jb                    Use jailbreak firmware patching + jailbreak CFW install.
   --dev                   Use dev firmware patching + dev CFW install.
   --less                  Use patchless firmware patching + CFW install.
+  --debug                 Add debug tooling to less variant (SRD, devmode, debugserver, SSH).
   --skip-project-setup    Skip setup_tools/build stage.
 
 Environment:
@@ -1002,6 +1007,7 @@ main() {
     fw_patch_target="fw_patch_less"
     cfw_install_target=""
     mode_label="less"
+    [[ "$DEBUG_MODE" -eq 1 ]] && mode_label="less+debug"
   fi
 
   echo "[*] setup_machine mode: ${mode_label}, project_setup=$([[ "$SKIP_PROJECT_SETUP" -eq 1 ]] && echo "skip" || echo "run"), non_interactive=${NONE_INTERACTIVE}"
@@ -1028,7 +1034,11 @@ main() {
   if [[ "$LESS_MODE" -eq 0 ]]; then
     run_make "Firmware patch" "$fw_patch_target"
   else
-    run_make_sudo "Firmware patch" "$fw_patch_target"
+    if [[ "$DEBUG_MODE" -eq 1 ]]; then
+      run_make_sudo "Firmware patch" "$fw_patch_target" "DEBUG=1"
+    else
+      run_make_sudo "Firmware patch" "$fw_patch_target"
+    fi
   fi
 
   echo ""

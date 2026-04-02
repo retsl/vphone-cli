@@ -29,6 +29,7 @@ public final class CryptexFilesystemPatcher: Patcher {
     public let component = "Filesystem"
     public let restoreDir: URL
     public let verbose: Bool
+    let debug: Bool
     let vphoneCliDirectory = URL(filePath: "./")
     
     var buildManiest: Data
@@ -37,10 +38,11 @@ public final class CryptexFilesystemPatcher: Patcher {
     
     // MARK: - Init
     
-    public init(buildManiest: Data, restoreDir: URL, verbose: Bool = true) {
+    public init(buildManiest: Data, restoreDir: URL, verbose: Bool = true, debug: Bool = false) {
         self.buildManiest = buildManiest
         self.restoreDir = restoreDir
         self.verbose = verbose
+        self.debug = debug
     }
     
     deinit {
@@ -128,6 +130,14 @@ public final class CryptexFilesystemPatcher: Patcher {
             print("- Patch Mobile Activation")
             try patchMobileActivation(targetMount: targetMount, cfwInput: cfwInputPath)
             
+            if debug {
+                print("- Patch debugserver")
+                try patchDebugserver(targetMount: targetMount, cfwInput: cfwInputPath)
+                
+                print("- Add dropbear (SSH)")
+                try addDropbear(targetMount: targetMount, cfwInput: cfwInputPath)
+            }
+            
             print("- Add vphoned")
             try addVphoned(targetMount: targetMount, cfwInput: cfwInputPath)
             try patchLaunchdCacheLoader(targetMount: targetMount, cfwInput: cfwInputPath)
@@ -202,6 +212,16 @@ public final class CryptexFilesystemPatcher: Patcher {
         try FileManager.default.createDirectory(at: launchDaemonsPath, withIntermediateDirectories: false)
         try FileManager.default.moveItem(at: launchdOgPath, to: launchdPath)
         try FileManager.default.copyItem(at: vphonedLaunchdPlist, to: launchDaemonsPath.appending(path: vphonedLaunchdPlist.lastPathComponent))
+        // Include SSH daemon plists so inject-daemons registers them in launchd
+        if debug {
+            let daemonPlistsDir = cfwInput.appending(path: "cfw_input/jb/LaunchDaemons")
+            for name in ["dropbear.plist", "bash.plist"] {
+                let src = daemonPlistsDir.appending(path: name)
+                if FileManager.default.fileExists(atPath: src.path) {
+                    try FileManager.default.copyItem(at: src, to: launchDaemonsPath.appending(path: name))
+                }
+            }
+        }
         _ = try runProcess(vphoneCliDirectory.appending(path: ".venv/bin/python3").path, [
             vphoneCliDirectory.appending(path: "scripts/patchers/cfw.py").path, "inject-daemons",
             launchdPath.path, launchDaemonsPath.path
@@ -272,8 +292,10 @@ public final class CryptexFilesystemPatcher: Patcher {
     func patchMobileActivation(targetMount: String, cfwInput: URL) throws {
         let target = URL.init(filePath: targetMount)
         let mobileActivationdPath = target.appending(path: "/usr/libexec/mobileactivationd")
-        _ = try runProcess("./.venv/bin/python3", [
-            "./scripts/patchers/cfw.py", "patch-mobileactivationd",
+        let pythonPath = vphoneCliDirectory.appending(path: ".venv/bin/python3")
+        let patcherPath = vphoneCliDirectory.appending(path: "scripts/patchers/cfw.py")
+        _ = try runProcess(pythonPath.path, [
+            patcherPath.path, "patch-mobileactivationd",
             mobileActivationdPath.path
         ])
         _ = try runProcess("/bin/chmod", ["0755", mobileActivationdPath.path])
@@ -283,6 +305,123 @@ public final class CryptexFilesystemPatcher: Patcher {
             "-S", "-M", "-K\(signingCertificatePath.path)",
             mobileActivationdPath.path
         ])
+    }
+    
+    // MARK: - Debug: Debugserver
+    
+    func patchDebugserver(targetMount: String, cfwInput: URL) throws {
+        let target = URL(filePath: targetMount)
+        let debugserverPath = target.appending(path: "/usr/libexec/debugserver")
+        
+        guard FileManager.default.fileExists(atPath: debugserverPath.path) else {
+            print("  debugserver not found, skipping")
+            return
+        }
+        
+        // Extract stock entitlements (: prefix = raw plist without blob header)
+        let tmpDir = try createTmpDir()
+        let stockEntPath = tmpDir.appending(path: "debugserver-stock.plist")
+        _ = try runProcess("/usr/bin/codesign", [
+            "-d", "--entitlements", ":\(stockEntPath.path)", debugserverPath.path
+        ])
+        
+        // Convert to XML for plutil editing
+        let researchEntPath = tmpDir.appending(path: "debugserver-research.plist")
+        _ = try runProcess("/usr/bin/plutil", [
+            "-convert", "xml1", "-o", researchEntPath.path, stockEntPath.path
+        ])
+        
+        // Merge SRD entitlements on top of stock (matching Apple's SRD tooling approach).
+        // plutil uses '.' as nesting operator — entitlement key dots must be escaped.
+        let srdKeys: [(String, String)] = [
+            ("research\\.com\\.apple\\.license-to-operate", "true"),
+            ("task_for_pid-allow", "true"),
+            ("com\\.apple\\.private\\.cs\\.debugger", "true"),
+            ("com\\.apple\\.private\\.security\\.no-container", "true"),
+            ("com\\.apple\\.private\\.memorystatus", "true"),
+            ("com\\.apple\\.private\\.logging\\.diagnostic", "true"),
+            ("com\\.apple\\.security\\.network\\.client", "true"),
+            ("com\\.apple\\.security\\.network\\.server", "true"),
+            ("com\\.apple\\.backboardd\\.debugapplications", "true"),
+            ("com\\.apple\\.backboardd\\.launchapplications", "true"),
+            ("com\\.apple\\.frontboard\\.debugapplications", "true"),
+            ("com\\.apple\\.frontboard\\.launchapplications", "true"),
+            ("com\\.apple\\.springboard\\.debugapplications", "true"),
+        ]
+        for (key, val) in srdKeys {
+            _ = try? runProcess("/usr/bin/plutil", [
+                "-insert", key, "-bool", val, "--", researchEntPath.path
+            ])
+        }
+        
+        // Remove seatbelt sandbox profile (opt out of platform sandbox)
+        _ = try? runProcess("/usr/bin/plutil", [
+            "-remove", "seatbelt-profiles", "--", researchEntPath.path
+        ])
+        
+        // Re-sign preserving identifier/requirements/flags/runtime
+        _ = try runProcess("/usr/bin/codesign", [
+            "--sign", "-",
+            "--force",
+            "--preserve-metadata=identifier,requirements,flags,runtime",
+            "--entitlements", researchEntPath.path,
+            debugserverPath.path
+        ])
+        _ = try runProcess("/bin/chmod", ["0755", debugserverPath.path])
+    }
+    
+    // MARK: - Debug: Dropbear SSH
+    
+    func addDropbear(targetMount: String, cfwInput: URL) throws {
+        let target = URL(filePath: targetMount)
+        let fm = FileManager.default
+        
+        // Extract iosbinpack64 (dropbear, bash, utilities)
+        let binpackTarPath = cfwInput.appending(path: "cfw_input/jb/iosbinpack64.tar")
+        _ = try runProcess("/usr/bin/tar", [
+            "-xpf", binpackTarPath.path,
+            "-C", target.path
+        ])
+        _ = try? runProcess("/usr/bin/find", [
+            target.appending(path: "iosbinpack64").path, "-name", "._*", "-delete"
+        ])
+        _ = try runProcess("/usr/sbin/chown", ["-R", "0:0", target.appending(path: "iosbinpack64").path])
+        
+        // Pre-generate dropbear host keys
+        let dropbearkeyPath = "/opt/homebrew/bin/dropbearkey"
+        guard fm.fileExists(atPath: dropbearkeyPath) else {
+            throw ProcessError.failed(1, "dropbearkey not found — install with: brew install dropbear")
+        }
+        let dropbearDir = target.appending(path: "var/dropbear")
+        try fm.createDirectory(at: dropbearDir, withIntermediateDirectories: true)
+        _ = try runProcess(dropbearkeyPath, [
+            "-t", "rsa", "-f", dropbearDir.appending(path: "dropbear_rsa_host_key").path
+        ])
+        _ = try runProcess(dropbearkeyPath, [
+            "-t", "ecdsa", "-f", dropbearDir.appending(path: "dropbear_ecdsa_host_key").path
+        ])
+        
+        // Copy shell profiles
+        let binpackEtc = target.appending(path: "iosbinpack64/etc")
+        let varDir = target.appending(path: "var")
+        for name in ["profile", "motd"] {
+            let src = binpackEtc.appending(path: name)
+            let dst = varDir.appending(path: name)
+            if fm.fileExists(atPath: src.path) && !fm.fileExists(atPath: dst.path) {
+                try fm.copyItem(at: src, to: dst)
+            }
+        }
+        
+        // Copy SSH daemon plists to LaunchDaemons
+        let daemonPlistsDir = cfwInput.appending(path: "cfw_input/jb/LaunchDaemons")
+        let launchDaemonsDir = target.appending(path: "System/Library/LaunchDaemons")
+        for name in ["dropbear.plist", "bash.plist"] {
+            let src = daemonPlistsDir.appending(path: name)
+            let dst = launchDaemonsDir.appending(path: name)
+            if fm.fileExists(atPath: src.path) && !fm.fileExists(atPath: dst.path) {
+                try fm.copyItem(at: src, to: dst)
+            }
+        }
     }
     
     func addDyldSymlinks(targetMount: String) throws {

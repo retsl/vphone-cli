@@ -5,7 +5,9 @@
 // Strategy:
 //   1. Parse the flat device tree binary into a node/property tree.
 //   2. Apply a fixed set of property patches (serial-number, home-button-type,
-//      artwork-device-subtype, island-notch-location).
+//      artwork-device-subtype, island-notch-location).  When debug is enabled,
+//      also apply SRD patches (research-enabled, debug-enabled, esdm-fuses,
+//      product-description, product-name).
 //   3. Serialize the modified tree back to flat binary.
 
 import Foundation
@@ -14,6 +16,7 @@ import Foundation
 public final class DeviceTreePatcher: Patcher {
     public let component = "devicetree"
     public let verbose: Bool
+    let debug: Bool
 
     let buffer: BinaryBuffer
     var patches: [PatchRecord] = []
@@ -30,6 +33,10 @@ public final class DeviceTreePatcher: Patcher {
         let value: PropertyValue
         let patchID: String
         let description: String
+        /// When true, insert the property if it does not already exist in the node.
+        var insertIfMissing: Bool = false
+        /// When true, this patch is only applied when `debug` is enabled.
+        var debugOnly: Bool = false
     }
 
     /// The value to write into a device tree property.
@@ -76,6 +83,59 @@ public final class DeviceTreePatcher: Patcher {
             patchID: "devicetree.island_notch_location",
             description: "Set island notch location to 144"
         ),
+        PropertyPatch(
+            nodePath: ["device-tree", "chosen"],
+            property: "research-enabled",
+            length: 4,
+            flags: 0,
+            value: .integer(1),
+            patchID: "devicetree.research_enabled",
+            description: "Set research-enabled = 1 in chosen",
+            insertIfMissing: true,
+            debugOnly: true
+        ),
+        PropertyPatch(
+            nodePath: ["device-tree", "chosen"],
+            property: "debug-enabled",
+            length: 4,
+            flags: 0,
+            value: .integer(1),
+            patchID: "devicetree.debug_enabled",
+            description: "Set debug-enabled = 1 in chosen",
+            insertIfMissing: true,
+            debugOnly: true
+        ),
+        PropertyPatch(
+            nodePath: ["device-tree", "chosen"],
+            property: "esdm-fuses",
+            length: 4,
+            flags: 0,
+            value: .integer(1),
+            patchID: "devicetree.esdm_fuses",
+            description: "Set esdm-fuses = 1 (ESDM bit 0) in chosen",
+            insertIfMissing: true,
+            debugOnly: true
+        ),
+        PropertyPatch(
+            nodePath: ["device-tree", "product"],
+            property: "product-description",
+            length: 26,
+            flags: 0,
+            value: .string("iPhone 16 Research Device"),
+            patchID: "devicetree.product_description",
+            description: "Set product-description to iPhone 16 Research Device",
+            debugOnly: true
+        ),
+        PropertyPatch(
+            nodePath: ["device-tree", "product"],
+            property: "product-name",
+            length: 26,
+            flags: 0,
+            value: .string("iPhone 16 Research Device"),
+            patchID: "devicetree.product_name",
+            description: "Set product-name to iPhone 16 Research Device",
+            debugOnly: true
+        ),
     ]
 
     // MARK: - Device Tree Structures
@@ -106,9 +166,10 @@ public final class DeviceTreePatcher: Patcher {
 
     // MARK: - Init
 
-    public init(data: Data, verbose: Bool = true) {
+    public init(data: Data, verbose: Bool = true, debug: Bool = false) {
         buffer = BinaryBuffer(data)
         self.verbose = verbose
+        self.debug = debug
     }
 
     // MARK: - Patcher
@@ -308,6 +369,16 @@ public final class DeviceTreePatcher: Patcher {
         return raw
     }
 
+    /// Encode a `PropertyValue` into bytes.
+    private static func encodeValue(_ value: PropertyValue, length: Int) throws -> Data {
+        switch value {
+        case let .string(s):
+            return encodeFixedString(s, length: length)
+        case let .integer(v):
+            return try encodeInteger(v, length: length)
+        }
+    }
+
     /// Encode an integer value as little-endian bytes.
     private static func encodeInteger(_ value: UInt64, length: Int) throws -> Data {
         var data = Data(count: length)
@@ -333,19 +404,31 @@ public final class DeviceTreePatcher: Patcher {
     /// Apply all property patches and record each change.
     private func applyPatches(root: DTNode) throws {
         for patch in Self.propertyPatches {
+            if patch.debugOnly && !debug { continue }
+
             let node = try resolveNode(root, path: patch.nodePath)
-            let prop = try findProperty(node, name: patch.property)
 
-            let originalBytes = Data(prop.value.prefix(patch.length))
+            let prop: DTProperty
+            let originalBytes: Data
 
-            let newValue: Data = switch patch.value {
-            case let .string(s):
-                Self.encodeFixedString(s, length: patch.length)
-            case let .integer(v):
-                try Self.encodeInteger(v, length: patch.length)
+            if let existing = node.properties.first(where: { $0.name == patch.property }) {
+                prop = existing
+                originalBytes = Data(prop.value.prefix(patch.length))
+            } else if patch.insertIfMissing {
+                let newProp = DTProperty(
+                    name: patch.property, length: 0, flags: 0,
+                    value: Data(), valueOffset: 0
+                )
+                node.properties.append(newProp)
+                prop = newProp
+                originalBytes = Data()
+            } else {
+                throw PatcherError.patchSiteNotFound("DeviceTree: missing property '\(patch.property)'")
             }
 
-            prop.length = patch.length
+            let newValue = try Self.encodeValue(patch.value, length: patch.length)
+
+            prop.length = newValue.count
             prop.flags = patch.flags
             prop.value = newValue
 

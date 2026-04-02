@@ -74,6 +74,7 @@ public final class FirmwarePipeline {
     let vmDirectory: URL
     let variant: Variant
     let verbose: Bool
+    let debug: Bool
     let loader: any FirmwareLoader
 
     // MARK: - Init
@@ -82,11 +83,13 @@ public final class FirmwarePipeline {
         vmDirectory: URL,
         variant: Variant = .regular,
         verbose: Bool = true,
+        debug: Bool = false,
         loader: (any FirmwareLoader)? = nil
     ) {
         self.vmDirectory = vmDirectory
         self.variant = variant
         self.verbose = verbose
+        self.debug = debug
         self.loader = loader ?? ContainerFirmwareLoader()
     }
 
@@ -231,13 +234,17 @@ public final class FirmwarePipeline {
             }]
         ))
 
-        // 5. TXM — dev/jb variants use TXMDevPatcher (adds entitlements, debugger, dev-mode)
+        // 5. TXM — dev/jb variants use TXMDevPatcher; less+debug uses developerMode only
         components.append(ComponentDescriptor(
             name: "TXM",
             inRestoreDir: true,
             searchPatterns: ["Firmware/txm.iphoneos.research.im4p"],
             patcherFactories: {
                 return switch variant {
+                case .less where debug:
+                    [{ data, verbose in
+                        TXMDevPatcher(data: data, verbose: verbose, patchSet: .developerMode)
+                    }]
                 case .less:
                     []
                 case .regular:
@@ -278,13 +285,13 @@ public final class FirmwarePipeline {
             }()
         ))
 
-        // 7. DeviceTree — same for all variants
+        // 7. DeviceTree — same for all variants; debug adds SRD branding patches
         components.append(ComponentDescriptor(
             name: "DeviceTree",
             inRestoreDir: true,
             searchPatterns: ["Firmware/all_flash/DeviceTree.vphone600ap.im4p"],
             patcherFactories: [{ data, verbose in
-                DeviceTreePatcher(data: data, verbose: verbose)
+                DeviceTreePatcher(data: data, verbose: verbose, debug: self.debug)
             }]
         ))
         
@@ -297,7 +304,7 @@ public final class FirmwarePipeline {
                 return switch variant {
                 case .less:
                     [{ data, verbose in
-                        CryptexFilesystemPatcher(buildManiest: data, restoreDir: try! self.findRestoreDirectory(), verbose: verbose)
+                        CryptexFilesystemPatcher(buildManiest: data, restoreDir: try! self.findRestoreDirectory(), verbose: verbose, debug: self.debug)
                     }]
                 case .regular, .dev, .jb:
                     []

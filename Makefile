@@ -88,6 +88,7 @@ help:
 	@echo "             CLOUDOS_SOURCE=   URL or local path to cloudOS IPSW"
 	@echo "  make fw_patch                Patch boot chain with Swift pipeline (regular variant)"
 	@echo "  make fw_patch_less           Patch boot chain with Swift pipeline (less patches)"
+	@echo "             DEBUG=1           Add debug tooling (SRD branding, developer mode, debugserver, SSH)"
 	@echo "  make fw_patch_dev            Patch boot chain with Swift pipeline (dev mode TXM patches)"
 	@echo "  make fw_patch_jb             Patch boot chain with Swift pipeline (dev + JB extensions)"
 	@echo ""
@@ -127,6 +128,7 @@ setup_machine:
 		$(if $(filter 1 true yes YES TRUE,$(JB)),--jb,) \
 		$(if $(filter 1 true yes YES TRUE,$(DEV)),--dev,) \
 		$(if $(filter 1 true yes YES TRUE,$(LESS)),--less,) \
+		$(if $(filter 1 true yes YES TRUE,$(DEBUG)),--debug,) \
 		$(if $(filter 1 true yes YES TRUE,$(SKIP_PROJECT_SETUP)),--skip-project-setup,)
 
 setup_tools:
@@ -295,7 +297,7 @@ fw_patch_less: patcher_build
 		echo "fw_patch_less must be run via sudo" >&2; \
 		exit 1; \
 	fi; \
-	"$(CURDIR)/$(PATCHER_BINARY)" patch-firmware --vm-directory "$(CURDIR)/$(VM_DIR)" --variant less'
+	"$(CURDIR)/$(PATCHER_BINARY)" patch-firmware --vm-directory "$(CURDIR)/$(VM_DIR)" --variant less $(if $(filter 1 true yes YES TRUE,$(DEBUG)),--debug,)'
 
 fw_patch_dev: patcher_build
 	"$(CURDIR)/$(PATCHER_BINARY)" patch-firmware --vm-directory "$(CURDIR)/$(VM_DIR)" --variant dev

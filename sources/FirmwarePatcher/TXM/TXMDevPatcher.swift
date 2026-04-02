@@ -13,14 +13,35 @@ import Foundation
 ///   4. debugger entitlement BL → mov w0, #1
 ///   5. developer-mode guard → nop
 public final class TXMDevPatcher: TXMPatcher {
+    /// Controls which patches are applied.
+    public enum PatchSet {
+        /// Trustcache bypass + all dev patches (selector24, get-task-allow,
+        /// selector42|29 shellcode, debugger entitlement, developer mode).
+        case all
+        /// Developer-mode guard NOP only (for the `less` variant with `--debug`).
+        case developerMode
+    }
+
+    let patchSet: PatchSet
+
+    public init(data: Data, verbose: Bool = true, patchSet: PatchSet = .all) {
+        self.patchSet = patchSet
+        super.init(data: data, verbose: verbose)
+    }
+
     override public func findAll() throws -> [PatchRecord] {
         patches = []
-        try patchTrustcacheBypass() // base patch
-        patchSelector24ForcePass()
-        patchGetTaskAllowForceTrue()
-        patchSelector42_29Shellcode()
-        patchDebuggerEntitlementForceTrue()
-        patchDeveloperModeBypass()
+        switch patchSet {
+        case .all:
+            try patchTrustcacheBypass() // base patch
+            patchSelector24ForcePass()
+            patchGetTaskAllowForceTrue()
+            patchSelector42_29Shellcode()
+            patchDebuggerEntitlementForceTrue()
+            patchDeveloperModeBypass()
+        case .developerMode:
+            patchDeveloperModeBypass()
+        }
         return patches
     }
 

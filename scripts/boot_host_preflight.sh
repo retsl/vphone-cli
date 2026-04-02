@@ -71,13 +71,17 @@ RESEARCH_GUEST_STATUS="$(
     # Single install or already got a direct answer
     echo "$_out"
   else
-    # Multiple installs: try to auto-select "Macintosh HD"
-    _num=$(echo "$_out" | awk '/Macintosh HD/ { match($0, /[0-9]+/); if (RSTART > 0) { print substr($0, RSTART, RLENGTH); exit } }')
+    # Multiple installs: try to auto-select the currently booted volume.
+    _boot_vol=$(diskutil info / 2>/dev/null | awk -F':[[:space:]]+' '/Volume Name/ {print $2; exit}' || true)
+    _num=""
+    if [[ -n "$_boot_vol" ]]; then
+      _num=$(echo "$_out" | awk -v vol="$_boot_vol" 'index($0, vol) { match($0, /[0-9]+/); if (RSTART > 0) { print substr($0, RSTART, RLENGTH); exit } }')
+    fi
     if [[ -n "$_num" ]]; then
       _result=$(printf '%s\n' "$_num" | csrutil allow-research-guests status 2>/dev/null \
         | grep -o 'Allow Research Guests status:.*' || true)
       if [[ -n "$_result" ]]; then
-        echo "(auto-selected: Macintosh HD) $_result"
+        echo "(auto-selected: ${_boot_vol}) $_result"
         exit 0
       fi
     fi
