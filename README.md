@@ -36,6 +36,9 @@ See [research/0_binary_patch_comparison.md](./research/0_binary_patch_comparison
 
 **Configure SIP/AMFI** — required for private Virtualization.framework entitlements and unsigned binary workflows.
 
+The Patchless variant depends on an "untrusted" arm64e binary. You have to allow this by setting the host boot args "-arm64e_preview_abi" (and "amfi_get_out_of_my_way=1").
+
+
 Boot into Recovery (long press power button), open Terminal, then choose one setup path:
 
 - **Option 1: Fully disable SIP + AMFI boot-arg (most permissive)**
